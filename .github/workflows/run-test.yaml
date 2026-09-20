@@ -1,27 +1,45 @@
 name: Run tests
 
 on:
-  # run on push in main or rel_* branches excluding changes are only on doc or example folders
-  push:
-    branches:
-      - main
-      - "rel_*"
-      # branches used to test the workflow
-      - "workflow_test_*"
-    paths-ignore:
-      - "docs/**"
+  # Sealed rebuild: dispatch-only. Upstream triggered this workflow on push to
+  # main/rel_*; on the sealed fork that would auto-fire on the sync push, so the
+  # push trigger is replaced by an explicit manual/API dispatch.
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: >-
+          Optional pytest selector (file paths / node IDs) passed through tox as
+          posargs. Empty runs the full suite.
+        required: false
+        default: ""
+
+env:
+  # Registry time machine: resolve every pip install against the state of PyPI
+  # on Mako 1.2.4's release date (2022-11-15), so the 2022-era code is tested
+  # and built against 2022-era tooling and dependencies rather than whatever is
+  # current. This is set at workflow level so it reaches BOTH the tox/pytest
+  # legs and the artifact build. tox 3 carries PIP_INDEX_URL into the
+  # virtualenvs it creates via its default passenv list, so the test
+  # dependencies (pytest, beaker, markupsafe, pygments, babel, dogpile.cache,
+  # lingua<4 - all unpinned in tox.ini) resolve at release-date versions too.
+  # It also keeps the "pip install --upgrade tox setuptools" step installable on
+  # Python 3.7, which current pip/tox/setuptools releases no longer support.
+  PIP_INDEX_URL: "https://:2022-11-15@time-machines-pypi.sealsecurity.io/"
 
 jobs:
   run-test:
     name: ${{ matrix.python-version }}-${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
+    # Generous: the macOS legs may compile CPython from source (see the macOS
+    # setup step), which the 30 minutes the other legs need does not cover.
+    timeout-minutes: 90
     strategy:
       # run this job using this matrix
       matrix:
         os:
-          - "ubuntu-latest"
-          - "windows-latest"
-          - "macos-latest"
+          - "ubuntu"
+          - "windows"
+          - "macos"
         python-version:
           - "3.7"
           - "3.8"
@@ -31,27 +49,144 @@ jobs:
         exclude:
           # beaker raises warning on 3.10. only windows seems affected
           # See https://github.com/bbangert/beaker/pull/213
-          - os: "windows-latest"
+          - os: "windows"
             python-version: "3.10"
+
+          # macOS x Python 3.7 cannot be provisioned on any macOS runner that
+          # still exists. Upstream ran it on an Intel image; macos-13 was the
+          # last of those and is retired (a job pinning it queues forever), so
+          # every live macOS runner is arm64. There:
+          #   * actions/setup-python has no darwin-arm64 3.7 build in the
+          #     python-versions manifest - not one patch release; and
+          #   * building 3.7 from source fails too, because CPython <3.9 needs
+          #     OpenSSL 1.1 and Homebrew has deleted the openssl@1.1 formula
+          #     ("No available formula with the name openssl@1.1").
+          # This is the runner being unable to execute the leg at all, not a
+          # test failure. macOS itself stays covered and green on 3.8/3.9/3.10,
+          # and 3.7 stays covered on ubuntu and windows.
+          - os: "macos"
+            python-version: "3.7"
+
+        include:
+          # Pin the runner image per OS rather than relying on a "-latest"
+          # label, because the -latest images have moved past the Python
+          # versions this matrix needs (actions/python-versions manifest):
+          #   * ubuntu-22.04 - CPython 3.7 x64 exists for linux 22.04 but NOT
+          #     for linux 24.04, which is what ubuntu-latest resolves to today.
+          #     3.8/3.9/3.10 exist for both, so one image covers all four legs.
+          #   * macos-latest - macos-13, the last x64 (Intel) macOS image, is
+          #     retired and queues forever, so macOS is arm64 now.
+          #     actions/setup-python cannot provision 3.7/3.8/3.9 there (the
+          #     python-versions manifest carries no darwin-arm64 3.7 build at
+          #     all), so the macOS legs use MatteoH2O1999/setup-python instead -
+          #     see the "Set up python (macOS)" step below. No leg is dropped.
+          #   * windows-2022 - win32 builds are image-independent, so this is
+          #     purely an era-appropriate pin for a 2022 release.
+          # No matrix leg is dropped: every (os, python) pair upstream ran still
+          # runs, just on an image that can still provide the interpreter.
+          - os: "ubuntu"
+            runner: "ubuntu-22.04"
+          - os: "windows"
+            runner: "windows-2022"
+          - os: "macos"
+            runner: "macos-latest"
 
       fail-fast: false
 
     # steps to run in each job. Some are github actions, others run shell commands
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Set up python
-        uses: actions/setup-python@v2
+        if: matrix.os != 'macos'
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          architecture: ${{ matrix.architecture }}
+
+      - name: Set up python (macOS)
+        # macos-latest is arm64 and actions/setup-python has no darwin-arm64
+        # build for 3.7 (and only token ones for 3.8/3.9), so it fails to
+        # provision most of this matrix there. That is a provisioning gap, not
+        # an executability one - the arm64 runner runs those interpreters fine.
+        # This drop-in resolves a prebuilt darwin-arm64 build where one exists
+        # and compiles the interpreter from source where none does, which keeps
+        # every upstream (os, python) leg running instead of excluding it.
+        if: matrix.os == 'macos'
+        uses: MatteoH2O1999/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache-build: true
+          allow-build: allow
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install --upgrade tox setuptools
+          # The runner images preinstall a modern setuptools (79.0.1), which is
+          # NEWER than anything the release-date index offers, so the
+          # "--upgrade setuptools" above is a silent no-op and leaves it in
+          # place. tox 3.27.1 then pins packaging 21.3 into the same
+          # site-packages, and that pair is incompatible: setuptools 79 calls
+          # canonicalize_version(strip_trailing_zero=...), a keyword packaging
+          # 21.3 does not have, so "tox" dies with
+          #   TypeError: canonicalize_version() got an unexpected keyword
+          #   argument 'strip_trailing_zero'
+          # while packaging the sdist, before a single test runs. An explicit
+          # "==" downgrades where "--upgrade" cannot. 65.5.1 is the newest
+          # setuptools at the 2022-11-15 release date and still supports 3.7,
+          # so one pin covers every leg.
+          pip install "setuptools==65.5.1"
           pip list
 
       - name: Run tests
-        run: tox
+        run: tox -- ${{ inputs.test-filter }}
+
+  build:
+    # Artifact build. Upstream has no workflow that produces the release
+    # distributions, so the missing build + upload steps are added here as a
+    # single dedicated job rather than as a step on every matrix leg.
+    name: build-artifacts
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install pinned build toolchain
+        # wheel 0.38.4 is the pin that matters for byte-equivalence: the
+        # published Mako-1.2.4-py3-none-any.whl records
+        # "Generator: bdist_wheel (0.38.4)" in its WHEEL metadata, and that
+        # string comes from the wheel package. setuptools 65.5.1 and build
+        # 0.9.0 are the newest releases of each that existed on 2022-11-15,
+        # i.e. exactly what the time-machine index above resolves to; they are
+        # named explicitly so the toolchain is auditable from the workflow.
+        run: |
+          python -m pip install --upgrade pip
+          pip install "setuptools==65.5.1" "wheel==0.38.4" "build==0.9.0"
+          pip list
+
+      - name: Build sdist and wheel
+        # --no-isolation is required: without it, build creates a fresh PEP 517
+        # environment from pyproject.toml's "setuptools >= 47, wheel" and the
+        # pinned wheel 0.38.4 above would be ignored, changing the Generator
+        # line.
+        run: python -m build --no-isolation
+
+      - name: Show built artifacts
+        run: |
+          ls -l dist/
+          python -c "import glob, zipfile; w = sorted(glob.glob('dist/*.whl'))[0]; z = zipfile.ZipFile(w); n = [i for i in z.namelist() if i.endswith('.dist-info/WHEEL')][0]; print(w); print(z.read(n).decode())"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mako-dist
+          path: dist/*
+          if-no-files-found: error

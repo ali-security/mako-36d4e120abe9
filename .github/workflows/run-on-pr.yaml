@@ -1,17 +1,15 @@
 name: Run tests on a pr
 
 on:
-  # run on pull request to main excluding changes that are only on doc or example folders
-  pull_request:
-    branches:
-      - main
-    paths-ignore:
-      - "doc/**"
+  # Sealed rebuild: dispatch-only. Upstream triggered this workflow on pull
+  # request to main; on the sealed fork that must never fire by itself.
+  workflow_dispatch:
 
 jobs:
   run-test:
     name: ${{ matrix.python-version }}-${{ matrix.os }}-${{matrix.tox-env}}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       # run this job using this matrix
       matrix:
